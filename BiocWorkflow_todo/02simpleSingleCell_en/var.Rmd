@@ -221,7 +221,7 @@ saveRDS(sce.hsc, file="hsc_data.rds")
 这是通过在 `normalize()` 中对基于基因和 spike-in 的 size factors 进行 centering 来实现的。如此一来，具有相近的平均计数的特征也会具有相近的归一化丰度。
 但是，如果 `SingleCellExperiment` 对象在 `normalize()` _后_ `trendVar()` _前_被进行子集化等操纵, centering 可能不会被保留-因此产生警告。
 
-## 当 spike-ins 不可获得时
+## 当无法获得 spike-ins 时
 
 一些数据集中， spike-in RNA 量不合适或根本没有 spike-in RNA。
 使用 `makeTechTrend()` 来假定泊松技术噪音也不太恰当，尤其是对放大噪音不可忽略时读取 count 数据。
