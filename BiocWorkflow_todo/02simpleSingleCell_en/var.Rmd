@@ -1,0 +1,369 @@
+---
+title: 表征单细胞RNA-seq数据中的基因表达变异
+author: 
+- name: Aaron T. L. Lun
+  affiliation: &CRUK Cancer Research UK Cambridge Institute, Li Ka Shing Centre, Robinson Way, Cambridge CB2 0RE, United Kingdom
+- name: Davis J. McCarthy
+  affiliation: 
+  - &EMBL EMBL European Bioinformatics Institute, Wellcome Genome Campus, Hinxton, Cambridge CB10 1SD, United Kingdom
+  - St Vincent's Institute of Medical Research, 41 Victoria Parade, Fitzroy, Victoria 3065, Australia
+- name: John C. Marioni
+  affiliation: 
+  - *CRUK
+  - *EMBL
+  - Wellcome Trust Sanger Institute, Wellcome Genome Campus, Hinxton, Cambridge CB10 1SA, United Kingdom
+date: "`r Sys.Date()`"
+vignette: >
+  %\VignetteIndexEntry{09. Advanced variance modelling}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}    
+output: 
+  BiocStyle::html_document:
+    titlecaps: false
+    toc_float: true
+bibliography: ref.bib
+---
+    
+```{r style, echo=FALSE, results='hide', message=FALSE, cache=FALSE}
+library(BiocStyle)
+library(knitr)
+opts_chunk$set(error=FALSE, message=FALSE, warning=FALSE, cache=TRUE)
+opts_chunk$set(fig.asp=1)
+```
+
+```{r, cache=FALSE, echo=FALSE, results="hide"}
+simpleSingleCell:::.compile("reads") # 416B
+```
+
+# 概览
+
+在这里，我们对细胞群基因表达可变性建模的一些更具体的方面进行阐述。
+这包括检测显著高变异基因(HVGs)、在存在干扰因素的情况下对均值-方差趋势进行高级建模等
+。
+
+# 检测高变异基因
+
+## 概览
+
+高变异基因 HVGs 是指具有显著大于 0 的生物组分的基因。
+这些基因很有意思，它们引起细胞间表达谱的差异，应被优先考虑进一步研究。
+通过对高变异基因 HVGs 的形式化检测，我们能将由RNA捕获或文库制备过程中的采样噪音等技术因素引起的变化很大的基因排除在外。
+在之前的分析中，我们只对技术组分进行建模。这种检测能增强分析的统计严谨性。
+
+## 设置数据 
+
+### 加载数据集
+
+使用来自造血干细胞 HSCs 的数据[@wilson2015combined]来进行演示，数据由 Smart-seq2 实验方案[@picelli2014fulllength]和 ERCC spike-ins 生成。
+使用登录号[GSE61533]从 NCBI GEO 中获取 counts 作为补充文件(http://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE61533)。
+
+```{r}
+library(BiocFileCache)
+bfc <- BiocFileCache("raw_data", ask=FALSE)
+wilson.fname <- bfcrpath(bfc, file.path("ftp://ftp.ncbi.nlm.nih.gov/geo/series",
+    "GSE61nnn/GSE61533/suppl/GSE61533_HTSEQ_count_results.xls.gz"))
+
+library(R.utils)
+wilson.name2 <- "GSE61533_HTSEQ_count_results.xls"
+gunzip(wilson.fname, destname=wilson.name2, remove=FALSE, overwrite=TRUE)
+```
+
+首先需要将计数矩阵加载到内存中。
+在这种情况下，可能需要从 Gzip 压缩的 Excel 格式中检索数据。
+
+```{r}
+library(readxl)
+all.counts <- read_excel(wilson.name2)
+gene.names <- all.counts$ID
+all.counts <- as.matrix(all.counts[,-1])
+rownames(all.counts) <- gene.names
+```
+
+结果储存在 ‘SingleCellExperiment’ 对象中。根据行名称识别与 spike-ins 对应的行。
+
+```{r}
+library(SingleCellExperiment)
+sce.hsc <- SingleCellExperiment(list(counts=all.counts))
+dim(sce.hsc)
+is.spike <- grepl("^ERCC", rownames(sce.hsc))
+isSpike(sce.hsc, "ERCC") <- is.spike
+summary(is.spike)
+```
+
+### 质量控制和归一化
+
+如前所述，利用 `r Biocpkg("scater")` 中的 `calculateQCMetrics` 函数对每个细胞计算质量控制度量 [@mccarthy2017scater]。
+基于任何一项指标异常的 HSCs 都代表低质量文库的假设，将它们排除。
+
+```{r}
+library(scater)
+sce.hsc <- calculateQCMetrics(sce.hsc)
+libsize.drop <- isOutlier(sce.hsc$total_counts, nmads=3, type="lower", log=TRUE)
+feature.drop <- isOutlier(sce.hsc$total_features_by_counts, nmads=3, type="lower", log=TRUE)
+spike.drop <- isOutlier(sce.hsc$pct_counts_ERCC, nmads=3, type="higher")
+sce.hsc <- sce.hsc[,!(libsize.drop | feature.drop | spike.drop)]
+data.frame(ByLibSize=sum(libsize.drop), ByFeature=sum(feature.drop),
+    BySpike=sum(spike.drop), Remaining=ncol(sce.hsc))
+```
+
+为了减少后续步骤的计算工作，去除在任何细胞中都不表达的基因。
+
+```{r}
+to.keep <- nexprs(sce.hsc, byrow=TRUE) > 0
+sce.hsc <- sce.hsc[to.keep,]
+summary(to.keep)
+```
+
+使用去卷积方法对内源细胞计算 size factors[@lun2016pooling]。
+如前所述，对 spike-in 转录本的 size factors 也进行了计算。
+为后续分析，计算归一化的对数转换表达量。
+
+```{r, warning=FALSE}
+library(scran)
+sce.hsc <- computeSumFactors(sce.hsc)
+summary(sizeFactors(sce.hsc))
+sce.hsc <- computeSpikeFactors(sce.hsc, type="ERCC", general.use=FALSE)
+summary(sizeFactors(sce.hsc, "ERCC"))
+sce.hsc <- normalize(sce.hsc)
+```
+
+## 测试显著阳性的生物组分
+
+如前所述，我们对 spike-in 转录本进行均值-方差趋势拟合，以量化方差的技术组分。
+每个基因的生物组分被定义为其总方差和趋势拟合值之间的差异。 (Figure \@ref(fig:hvgplothsc)).
+
+```{r hvgplothsc, fig.cap="Variance of normalized log-expression values for each gene in the HSC dataset, plotted against the mean log-expression. The blue line represents the mean-dependent trend fitted to the variances of the spike-in transcripts (red)."}
+var.fit <- trendVar(sce.hsc, parametric=TRUE, loess.args=list(span=0.3))
+var.out <- decomposeVar(sce.hsc, var.fit)
+plot(var.out$mean, var.out$total, pch=16, cex=0.6, xlab="Mean log-expression", 
+    ylab="Variance of log-expression")
+curve(var.fit$trend(x), col="dodgerblue", lwd=2, add=TRUE)
+cur.spike <- isSpike(sce.hsc)
+points(var.out$mean[cur.spike], var.out$total[cur.spike], col="red", pch=16)
+```
+
+将 HVGs 定义为生物组分显著大于 0 的基因。
+对采用 Benjamini-Hochberg 法的多次测试进行校正后，我们选定错误发现率 （FDR） 为 5%。
+
+```{r}
+hvg.out <- var.out[which(var.out$FDR <= 0.05),]
+nrow(hvg.out)
+```
+
+对结果进行排序，以集中精力于具有较大生物组分的基因上。
+这突显了潜在假设检验的一个有趣的方面。这一检验是基于总方差和预期技术方差的比值的。
+基于 _p_ 值的排序优先考虑的 HVGs 往往更可能是真阳性，但同时也往往是无意义的。
+这是因为对于那些总方差非常低、对细胞间异质性贡献不大的 HVGs 而言，这个比值可能非常大。
+
+```{r}
+hvg.out <- hvg.out[order(hvg.out$bio, decreasing=TRUE),] 
+write.table(file="hsc_hvg.tsv", hvg.out, sep="\t", quote=FALSE, col.names=NA)
+head(hvg.out)
+```
+
+检查具有最大生物组分的基因表达量的分布。
+我们发现方差估值不是由一两个异常细胞导致的 (Figure \@ref(fig:hvgvioplothsc))。
+
+```{r hvgvioplothsc, fig.cap="Violin plots of normalized log-expression values for the top 10 genes with the largest biological components in the HSC dataset. Each point represents the log-expression value in a single cell."}
+fontsize <- theme(axis.text=element_text(size=12), axis.title=element_text(size=16))
+plotExpression(sce.hsc, features=rownames(hvg.out)[1:10]) + fontsize
+```
+
+## 讨论
+
+还有很多根据不同指标定义 HVGs 的策略，例如：
+
+-变异系数，在 `r Biocpkg("scran")` 中使用 `technicalCV2()` 函数 [@brennecke2013accounting] 或 `DM()` 函数 [@kim2015characterizing]
+-负二项分布的离散参数，在 `r Biocpkg("edgeR")` 中使用 `estimateDisp()` 函数 [@mccarthy2012differential]。
+-总体变异的一部分，使用 `r Biocpkg("BASiCS")` 包中的方法 [@vallejos2015basics]。 
+
+因为对数转换能排除仅在一两个细胞中强表达的基因，所以我们采用 log 表达量的方差。
+这降低了排名很高的一组 HVGs 不是受表达模式异常的基因支配的风险。当然大部分异常表达模式都无意义。
+
+如前所述，用 `saveRDS()` 将 HSC 数据集保存到文件中供日后使用。 
+
+```{r}
+saveRDS(sce.hsc, file="hsc_data.rds")
+```
+
+# 对均值-方差趋势拟合进行微调
+
+## 趋势拟合参数的具体信息
+
+采用 `trendVar()` 对均值方差趋势进行拟合。 spike-in 转录本数量有限，其丰度又分布不均匀，使这项工作变得复杂。
+对于数量较少的细胞，这些问题因方差估计的低精度而变得更为严重。
+因此，需要对 `span` 等趋势参数进行一些调整，以取得合适的拟合效果。详情请参阅 `?trendVar`。
+设置 `parametric=TRUE` 对于为均值-方差关系预期的波浪形状建模尤其有用。
+（因为这对任意趋势形状都不够 robust ，所以并不是默认设置。）
+
+`trendVar` 函数还会在趋势拟合前将低丰度基因自动过滤掉。
+这确保低丰度基因不会因离散性或低丰度基因的频率而干扰拟合，
+否则，会引起对围绕趋势线的方差变化程度估计的偏差，或降低 span-based 的平滑算法在更高丰度下的灵敏度。
+过滤策略的内部选择涉及多方面的考量：
+
+-使用 log 表达量而不是（文库大小调整后的）平均 count 来进行过滤。
+在线性建模框架中，log 表达量的平均值独立于方差估计 [@bourgon2010independent]，
+这能确保过滤不会在边界对方差引入虚假趋势。
+-使用 `trendVar` 中的 `min.mean` 参数规定过滤阈值。
+根据对模拟的泊松分布方差估计中出现的离散模式，选用默认阈值为 0.1（`min.mean`）。
+更低的阈值 （0.001-0.01） 可能更适用于来自 droplet-based 等实验方案的稀疏数据。
+-默认情况下，`trendVar` 中使用的过滤 _不_ 应用于 `decomposeVar`。
+保留所有基因能确保来自稀有亚群的弱生物信号不被丢弃。
+在函数调用中设置 `subset.row=rowMeans(logcounts(sce)) > 0.1`，从而在 `decomposeVar` 中应用过滤。
+
+**Aaron 的评论：**
+
+-用户有时可能会收到来自 `trendVar()` 关于 size factors 中缺少 centering 的警告。
+趋势是对 spike-in 转录本的均值和方差进行拟合的，且每个 _内源_ 基因的技术组分是通过插值进行估算。
+这是基于一个内源基因相当于一个具有相同丰度的 spike-in 转录本的假设。
+基于在计数模型中为人熟知的均值-方差关系，我们还假设差异主要是由counts的大小引起的。
+因此，需要确保平均 counts 中的相似性在标准化的表达量中得到保留。
+这是通过在 `normalize()` 中对基于基因和 spike-in 的 size factors 进行 centering 来实现的。如此一来，具有相近的平均计数的特征也会具有相近的归一化丰度。
+但是，如果 `SingleCellExperiment` 对象在 `normalize()` _后_ `trendVar()` _前_被进行子集化等操纵, centering 可能不会被保留-因此产生警告。
+
+## 当 spike-ins 不可获得时
+
+一些数据集中， spike-in RNA 量不合适或根本没有 spike-in RNA。
+使用 `makeTechTrend()` 来假定泊松技术噪音也不太恰当，尤其是对放大噪音不可忽略时读取 count 数据。
+在这些情况下，可以改为令趋势符合内源基因的方差估计。
+正如下面 HSC 数据集所示，这是依靠 `trendVar` 中的 `use.spikes=FALSE` 设置实现的。
+
+```{r}
+var.fit.nospike <- trendVar(sce.hsc, parametric=TRUE, 
+    use.spikes=FALSE, loess.args=list(span=0.2))
+var.out.nospike <- decomposeVar(sce.hsc, var.fit.nospike)
+```
+
+对结果进行最简单的解读，我们认为大多数基因不存在程度不一致的表达。
+这意味着技术组分主导大多数基因的总方差，由此，拟合的趋势可以被视为对技术组分的估计。
+图 \@ref(fig:hvgplot416b2) 中，趋势通过或接近大部分 spike-in 方差，表明我们的假设有效。
+
+```{r hvgplot416b2, fig.cap="Variance of normalized log-expression values for each gene in the 416B dataset, plotted against the mean log-expression. The blue line represents the mean-dependent trend fitted to the variances of the endogenous genes (black), with spike-in transcripts shown in red."}
+plot(var.out.nospike$mean, var.out.nospike$total, pch=16, cex=0.6, 
+    xlab="Mean log-expression", ylab="Variance of log-expression")
+curve(var.fit.nospike$trend(x), col="dodgerblue", lwd=2, add=TRUE)
+points(var.out.nospike$mean[cur.spike], var.out.nospike$total[cur.spike], col="red", pch=16)
+```
+
+如果假设不成立， decomposeVar 的输出结果将更难被解读。 
+因趋势拟合值还包含一些生物变异，它不再能被笼统地解释为技术组分。
+相反， `decomposeVar` 报告的生物组分代表着大多数具有相同丰度的基因中每个基因的剩余误差。
+可以认为，大多数基因的变异性是由组成性 house-keeping 过程引起的，它们是生物内源的，但往往无意义。
+任何方差增加的基因都是 _相对_ 高度变异的，可以优先进行进一步研究。
+
+# 剔除无意义变异因素
+
+## 使用 `block=` 参数
+
+之前对 416B 数据集的分析在 `trendVar()` 中指定了 `block=`，以确保培养皿间的系统差异不会扩大方差。
+这涉及 _分别_对每个培养皿中 log 表达量的均值和方差进行估计，
+然后对所有 spike-in 转录本培养皿特异的均值和方差进行单一趋势拟合。
+这么做还暗含着这样一个假设：培养皿间的趋势是一样的。对该数据集而言，这是一个合理的假设（Figure \@ref(fig:trendplotblock-416b)）。
+
+```{r trendplotblock-416b, fig.cap="Plate-specific variance estimates for all spike-in transcripts in the 416B dataset, plotted against the plate-specific means. Each point represents a spike-in transcript, numbered by the plate from which the values were estimated. The red line denotes the fitted mean-variance trend."}
+# Loading the saved object.
+sce.416B <- readRDS("416B_data.rds") 
+
+# Repeating the trendVar() call.
+var.fit <- trendVar(sce.416B, parametric=TRUE, block=sce.416B$Plate,
+    loess.args=list(span=0.3))
+
+matplot(var.fit$means, var.fit$vars, col=c("darkorange", "forestgreen"),
+    xlab="Mean log-expression", ylab="Variance of log-expression")
+curve(var.fit$trend(x), add=TRUE, col="red")
+```
+
+采用 `block=` 还假设：对内源基因和 spike-in 转录本而言，每个培养皿内的平均 size factor都接近于 unity。
+这意味着缩放归一化将保留 counts 的大小，从而允许具有相同平均丰度的基因进行培养皿内和培养皿间的比较。
+在内源基因平均值和 spike-in 转录本中，size factors 的分布和 unity 只存在适度的偏差，再一次表明假设是合理的（Figure \@ref(fig:sizefacplot-416b)）。
+
+```{r sizefacplot-416b, fig.width=10, fig.asp=0.5, fig.cap="Plate-specific distribution of the size factors for endogenous genes (left) and spike-in transcripts (right)."}
+tmp.416B <- sce.416B
+tmp.416B$log_size_factor <- log(sizeFactors(sce.416B))
+tmp.416B$log_size_factor_ERCC <- log(sizeFactors(sce.416B, "ERCC"))
+p1 <- plotColData(tmp.416B, x="Plate", y="log_size_factor")
+p2 <- plotColData(tmp.416B, x="Plate", y="log_size_factor_ERCC")
+multiplot(p1, p2, cols=2)
+```
+
+若在特定批次中加入更多的 spike-in RNA，则会严重违背上述假设。
+在该批次中，spike-in size factors 会系统地大于 unity，这意味着归一化后的平均丰度在 spike-in 转录本和内源基因间是不可比的。
+这将影响通过 interpolation from the trend 估计技术部分的准确性。
+一般而言，单独处理的批次可能不会表现出相同的技术方差，这样一来，采用单一趋势就将变得不合适。
+
+## 拟合批次特异的趋势
+
+对包含多个批次的数据集，还可以分别对每个批次进行趋势拟合和方差分解。
+这能调解批次间均值-方差趋势的差异，尤其是在每批次细胞中添加 spike-in RNA 的量不同的情况下。
+采用 `multiBlockVar()` 函数将 416B 数据集中的每个培养皿处理为不同的批次来演示这种方法。
+由此能得到对每个基因生物和技术组分的培养皿特异的估计。
+
+```{r}
+sce.416B.2 <- multiBlockNorm(sce.416B, sce.416B$Plate)
+comb.out <- multiBlockVar(sce.416B.2, block=sce.416B.2$Plate,
+    trend.args=list(parametric=TRUE, loess.args=list(span=0.4)))
+```
+
+采用 `multiBlockVar()` 中的 `combineVar()` 函数，将统计数据组合在多个批次中。
+该函数计算均值和方差批次间加权平均值，并采用 Fisher 法组合 $p$ 值。
+权重是根据每个批次中细胞数目来确定的，通过倾向于具有更多细胞和信息的批次来提高精度。
+这些结果可用于 `denoisePCA` 等下游函数，或检测高变异基因（见下文）。
+
+```{r}
+head(comb.out[,1:6])
+```
+
+通过从 `comb.out` 中提取相关统计数据，对批次特异的趋势拟合质量进行可视化处理。(Figure \@ref(fig:hvgplotbatch416b)).
+
+```{r hvgplotbatch416b, fig.width=10, fig.asp=0.5, fig.cap="Variance of normalized log-expression values for each gene in each plate of the 416B dataset, plotted against the mean log-expression. The blue line represents the mean-dependent trend fitted to the variances of the spike-in transcripts (red)."}
+par(mfrow=c(1,2))
+is.spike <- isSpike(sce.416B.2)
+for (plate in levels(sce.416B.2$Plate)) {
+    cur.out <- comb.out$per.block[[plate]]
+    plot(cur.out$mean, cur.out$total, pch=16, cex=0.6, xlab="Mean log-expression", 
+        ylab="Variance of log-expression", main=plate)
+    curve(metadata(cur.out)$trend(x), col="dodgerblue", lwd=2, add=TRUE)
+    points(cur.out$mean[is.spike], cur.out$total[is.spike], col="red", pch=16)
+}
+```
+
+通过分别拟合不同趋势，避免了需要假设批次间存在单一趋势。
+然而，因为每个批次中可用信息较少，这也会降低趋势拟合的精度。
+除非有明确的证据表明批次间的趋势存在差异，建议采用 `block=` 作为默认值。
+
+**Aaron 的评论：**
+
+-运行 `multiBlockNorm()` 以调整 blocking factor 不同水平内的 size factors。
+具体来说，缩放给定批次中细胞间的 spike-in size factors，使得其均值与同一组细胞基于基因的 size factors 的平均值相等。
+然后采用这些 centred size factors，重新计算归一化 log 表达量。
+这一步能确保 spike-in 转录本的平均丰度和内源基因相当，
+避免由批次间 spike-in RNA 数量差异导致的问题。
+否则，如果使用（来自 `normalize()` 的） globally-centred size factors，
+在 spike-in RNA 比数据集平均值更多或更少的批次中，与内源基因相比，spike-in 转录本的缩放将存在系统差异。
+拟合的趋势会因此沿 X 轴移动，不能准确捕捉到每个基因的技术组分。
+
+## 使用 `design=` 参数
+
+为了完整起见，有必要提到 `trendVar()` 中的 `design=` 参数。
+这将从一个拟合到基因的归一化 log 表达量的线性模型中估计剩余方差。
+该线性模型能包含方差中已知无用因素的 blocking factors，以确保它们不会扩大方差估值。
+基因的技术组分在所有细胞中以平均丰度获得。
+
+```{r}
+lfit <- trendVar(sce.416B, design=model.matrix(~sce.416B$Plate))
+```
+
+不建议对单项布局中的categorical blocking factors 使用这种方法。
+这是因为它不考虑每个 blocking level 的均值，导致在强 blocking 效应存在的情况下对技术组分估计的不准确。
+然而，它又是在加性模型中处理实际协变量或多个 blocking factors 的唯一方法。
+
+# 结语
+
+此 workflow 所使用的所有软件包都可以公开渠道从 Comprehensive R Archive Network (https://cran.r-project.org) 或 Bioconductor project (http://bioconductor.org) 处获得。
+使用的软件包的特定版本号及 R 安装的版本如下所示。
+
+```{r}
+sessionInfo()
+```
+
+# 参考文献
